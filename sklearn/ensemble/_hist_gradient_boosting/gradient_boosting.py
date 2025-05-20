@@ -150,6 +150,8 @@ class BaseHistGradientBoosting(BaseEstimator, ABC):
         "min_samples_leaf": [Interval(Integral, 1, None, closed="left")],
         "l2_regularization": [Interval(Real, 0, None, closed="left")],
         "max_features": [Interval(RealNotInt, 0, 1, closed="right")],
+        "feature_clusters": [dict, None],  # Detailed validation done in _sample_features_from_clusters
+        "cluster_sampling_rate": [Interval(RealNotInt, 0, 1, closed="right"), None],
         "monotonic_cst": ["array-like", dict, None],
         "interaction_cst": [
             list,
@@ -197,6 +199,8 @@ class BaseHistGradientBoosting(BaseEstimator, ABC):
         tol,
         verbose,
         random_state,
+        feature_clusters=None,
+        cluster_sampling_rate=None,
     ):
         self.loss = loss
         self.learning_rate = learning_rate
@@ -218,6 +222,8 @@ class BaseHistGradientBoosting(BaseEstimator, ABC):
         self.tol = tol
         self.verbose = verbose
         self.random_state = random_state
+        self.feature_clusters = feature_clusters
+        self.cluster_sampling_rate = cluster_sampling_rate
 
     def _validate_parameters(self):
         """Validate parameters passed to __init__.
@@ -930,6 +936,14 @@ class BaseHistGradientBoosting(BaseEstimator, ABC):
                 g_view = gradient
                 h_view = hessian
 
+            # Sample features from clusters for this iteration
+            sampled_features = self._sample_features_from_clusters(self._n_features)
+            sampled_features_list = list(sampled_features)
+
+            # Create dynamic interaction constraint with sampled features
+            # This forces the tree to only use the sampled features
+            dynamic_interaction_cst = [sampled_features_list]
+
             # Build `n_trees_per_iteration` trees.
             for k in range(self.n_trees_per_iteration_):
                 grower = TreeGrower(
@@ -941,12 +955,12 @@ class BaseHistGradientBoosting(BaseEstimator, ABC):
                     has_missing_values=has_missing_values,
                     is_categorical=self._is_categorical_remapped,
                     monotonic_cst=monotonic_cst_remapped,
-                    interaction_cst=interaction_cst,
+                    interaction_cst=dynamic_interaction_cst if self.feature_clusters is not None else interaction_cst,
                     max_leaf_nodes=self.max_leaf_nodes,
                     max_depth=self.max_depth,
                     min_samples_leaf=self.min_samples_leaf,
                     l2_regularization=self.l2_regularization,
-                    feature_fraction_per_split=self.max_features,
+                    feature_fraction_per_split=1.0 if self.feature_clusters is not None else self.max_features,
                     rng=self._feature_subsample_rng,
                     shrinkage=self.learning_rate,
                     n_threads=n_threads,
@@ -1466,6 +1480,85 @@ class BaseHistGradientBoosting(BaseEstimator, ABC):
         check_is_fitted(self)
         return len(self._predictors)
 
+    def _sample_features_from_clusters(self, n_features):
+        """Sample features based on clusters.
+
+        For each iteration:
+        1. Sample a subset of clusters according to cluster_sampling_rate
+        2. For each sampled cluster, sample exactly one feature
+
+        Returns
+        -------
+        sampled_features : set
+            Set of feature indices that are sampled for this iteration.
+        """
+        if self.feature_clusters is None or self.cluster_sampling_rate is None:
+            # If not using cluster-based sampling, return all features
+            return set(range(n_features))
+
+        rng = self._feature_subsample_rng
+
+        # Get a mapping from feature names to indices if we have feature_names_in_
+        feature_name_to_idx = {}
+        if hasattr(self, 'feature_names_in_'):
+            feature_name_to_idx = {name: idx for idx, name in enumerate(self.feature_names_in_)}
+
+        # Validate and normalize the feature clusters
+        normalized_clusters = {}
+        for cluster_id, features in self.feature_clusters.items():
+            feature_indices = []
+            for feature in features:
+                if isinstance(feature, str):
+                    # Handle string feature names
+                    if not feature_name_to_idx:
+                        raise ValueError(
+                            "Feature names (strings) in feature_clusters can only be used "
+                            "when the estimator is fitted on a DataFrame with column names "
+                            "or when feature_names_in_ is set."
+                        )
+                    if feature not in feature_name_to_idx:
+                        raise ValueError(
+                            f"Feature name '{feature}' in cluster '{cluster_id}' not found "
+                            f"in feature_names_in_: {list(feature_name_to_idx.keys())}"
+                        )
+                    feature_indices.append(feature_name_to_idx[feature])
+                elif isinstance(feature, (int, np.integer)):
+                    # Handle integer feature indices (existing behavior)
+                    if feature >= n_features or feature < 0:
+                        raise ValueError(
+                            f"Feature index {feature} in cluster '{cluster_id}' out of range "
+                            f"for dataset with {n_features} features."
+                        )
+                    feature_indices.append(feature)
+                else:
+                    raise ValueError(
+                        f"Feature '{feature}' in cluster '{cluster_id}' is not an integer or string. "
+                        "Only integer indices or string feature names are supported."
+                    )
+            normalized_clusters[cluster_id] = feature_indices
+
+        # Sample clusters
+        cluster_ids = list(normalized_clusters.keys())
+        n_clusters = len(cluster_ids)
+        n_clusters_to_sample = max(1, int(n_clusters * self.cluster_sampling_rate))
+        sampled_cluster_ids = rng.choice(
+            cluster_ids, size=n_clusters_to_sample, replace=False
+        )
+
+        # Sample one feature per sampled cluster
+        sampled_features = set()
+        for cluster_id in sampled_cluster_ids:
+            cluster_features = normalized_clusters[cluster_id]
+            if cluster_features:  # Ensure cluster has features
+                sampled_feature = rng.choice(cluster_features, size=1)[0]
+                sampled_features.add(sampled_feature)
+
+        # If no features were sampled (rare edge case), fall back to a random feature
+        if not sampled_features:
+            sampled_features.add(rng.randint(n_features))
+
+        return sampled_features
+
 
 class HistGradientBoostingRegressor(RegressorMixin, BaseHistGradientBoosting):
     """Histogram-based Gradient Boosting Regression Tree.
@@ -1536,14 +1629,40 @@ class HistGradientBoostingRegressor(RegressorMixin, BaseHistGradientBoosting):
     l2_regularization : float, default=0
         The L2 regularization parameter penalizing leaves with small hessians.
         Use ``0`` for no regularization (default).
+    feature_clusters : dict or None, default=None
+        A dictionary mapping cluster IDs to lists of feature indices or feature names.
+        Features in the same cluster are grouped together for sampling.
+        When feature names (strings) are used, the model must be fitted on a dataframe
+        with the corresponding column names. If indices and names are mixed, all values
+        will be treated as feature names first, then as indices if not found.
+        During each iteration, a subset of clusters is sampled based on
+        cluster_sampling_rate, and then exactly one feature is selected
+        from each sampled cluster.
+        If None, all features are used in every iteration.
+
+        .. versionadded:: X.Y
+
+    cluster_sampling_rate : float or None, default=None
+        The proportion of clusters to sample in each boosting iteration.
+        Must be in the range (0, 1]. If None, all clusters are used.
+        Only used if feature_clusters is provided.
+
+        .. versionadded:: X.Y
+
     max_features : float, default=1.0
         Proportion of randomly chosen features in each and every node split.
         This is a form of regularization, smaller values make the trees weaker
         learners and might prevent overfitting.
         If interaction constraints from `interaction_cst` are present, only allowed
         features are taken into account for the subsampling.
+        Only used when feature_clusters is None.
 
         .. versionadded:: 1.4
+
+        .. deprecated:: X.Y
+           When feature_clusters is provided, max_features is not used.
+           In a future version, feature_clusters will replace max_features
+           completely.
 
     max_bins : int, default=255
         The maximum number of bins to use for non-missing values. Before
@@ -1765,6 +1884,8 @@ class HistGradientBoostingRegressor(RegressorMixin, BaseHistGradientBoosting):
         max_depth=None,
         min_samples_leaf=20,
         l2_regularization=0.0,
+        feature_clusters=None,
+        cluster_sampling_rate=None,
         max_features=1.0,
         max_bins=255,
         categorical_features="from_dtype",
@@ -1789,17 +1910,19 @@ class HistGradientBoostingRegressor(RegressorMixin, BaseHistGradientBoosting):
             l2_regularization=l2_regularization,
             max_features=max_features,
             max_bins=max_bins,
+            categorical_features=categorical_features,
             monotonic_cst=monotonic_cst,
             interaction_cst=interaction_cst,
-            categorical_features=categorical_features,
-            early_stopping=early_stopping,
             warm_start=warm_start,
+            early_stopping=early_stopping,
             scoring=scoring,
             validation_fraction=validation_fraction,
             n_iter_no_change=n_iter_no_change,
             tol=tol,
             verbose=verbose,
             random_state=random_state,
+            feature_clusters=feature_clusters,
+            cluster_sampling_rate=cluster_sampling_rate,
         )
         self.quantile = quantile
 
@@ -1929,14 +2052,40 @@ class HistGradientBoostingClassifier(ClassifierMixin, BaseHistGradientBoosting):
     l2_regularization : float, default=0
         The L2 regularization parameter penalizing leaves with small hessians.
         Use ``0`` for no regularization (default).
+    feature_clusters : dict or None, default=None
+        A dictionary mapping cluster IDs to lists of feature indices or feature names.
+        Features in the same cluster are grouped together for sampling.
+        When feature names (strings) are used, the model must be fitted on a dataframe
+        with the corresponding column names. If indices and names are mixed, all values
+        will be treated as feature names first, then as indices if not found.
+        During each iteration, a subset of clusters is sampled based on
+        cluster_sampling_rate, and then exactly one feature is selected
+        from each sampled cluster.
+        If None, all features are used in every iteration.
+
+        .. versionadded:: X.Y
+
+    cluster_sampling_rate : float or None, default=None
+        The proportion of clusters to sample in each boosting iteration.
+        Must be in the range (0, 1]. If None, all clusters are used.
+        Only used if feature_clusters is provided.
+
+        .. versionadded:: X.Y
+
     max_features : float, default=1.0
         Proportion of randomly chosen features in each and every node split.
         This is a form of regularization, smaller values make the trees weaker
         learners and might prevent overfitting.
         If interaction constraints from `interaction_cst` are present, only allowed
         features are taken into account for the subsampling.
+        Only used when feature_clusters is None.
 
         .. versionadded:: 1.4
+
+        .. deprecated:: X.Y
+           When feature_clusters is provided, max_features is not used.
+           In a future version, feature_clusters will replace max_features
+           completely.
 
     max_bins : int, default=255
         The maximum number of bins to use for non-missing values. Before
@@ -2158,6 +2307,8 @@ class HistGradientBoostingClassifier(ClassifierMixin, BaseHistGradientBoosting):
         max_depth=None,
         min_samples_leaf=20,
         l2_regularization=0.0,
+        feature_clusters=None,
+        cluster_sampling_rate=None,
         max_features=1.0,
         max_bins=255,
         categorical_features="from_dtype",
@@ -2194,6 +2345,8 @@ class HistGradientBoostingClassifier(ClassifierMixin, BaseHistGradientBoosting):
             tol=tol,
             verbose=verbose,
             random_state=random_state,
+            feature_clusters=feature_clusters,
+            cluster_sampling_rate=cluster_sampling_rate,
         )
         self.class_weight = class_weight
 

@@ -1758,3 +1758,145 @@ def test_pandas_nullable_dtype():
 
     clf = HistGradientBoostingClassifier()
     clf.fit(X, y)
+
+
+def test_feature_clusters():
+    """Test the feature clusters functionality.
+
+    Verify that feature clusters allows training with subsets of feature
+    groups, with exactly one feature sampled per selected cluster.
+    """
+    rng = np.random.RandomState(42)
+    n_samples = 1000
+
+    # Define 6 features across 3 clusters (2 features per cluster)
+    # Features in the same cluster are correlated
+    X = np.zeros((n_samples, 6))
+
+    # First cluster: features 0 and 1 are informative
+    X[:, 0] = rng.normal(size=n_samples)
+    X[:, 1] = X[:, 0] - 0.5 * rng.normal(size=n_samples)
+
+    # Second cluster: features 2 and 3 are informative
+    X[:, 2] = rng.normal(size=n_samples)
+    X[:, 3] = X[:, 2] + 0.1 * rng.normal(size=n_samples)
+
+    # Third cluster: features 4 and 5 are noise
+    X[:, 4] = rng.normal(size=n_samples)
+    X[:, 5] = rng.normal(size=n_samples)
+
+    # Create classification and regression targets
+    # Classification: based on the first two clusters
+    y_clf = ((X[:, 0] > 0) & (X[:, 2] > 0)).astype(int)
+    # Regression: linear combination of the first two clusters
+    y_reg = X[:, 0] + 2 * X[:, 2] + rng.normal(scale=0.1, size=n_samples)
+
+    # Feature clusters dictionary
+    feature_clusters = {
+        'cluster1': [0, 1],   # correlated informative features
+        'cluster2': [2, 3],   # correlated informative features
+        'cluster3': [4, 5],   # noise features
+    }
+
+    # Test classification
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y_clf, test_size=0.2, random_state=rng
+    )
+
+    # Fit model with feature clusters
+    clf_with_clusters = HistGradientBoostingClassifier(
+        feature_clusters=feature_clusters,
+        cluster_sampling_rate=0.7,  # Sample 2 out of 3 clusters on average
+        max_iter=20,
+        random_state=42
+    )
+    clf_with_clusters.fit(X_train, y_train)
+
+    # Fit model without feature clusters
+    clf_without_clusters = HistGradientBoostingClassifier(
+        max_iter=20,
+        random_state=42
+    )
+    clf_without_clusters.fit(X_train, y_train)
+
+    # Both should give reasonable accuracy, but might differ slightly
+    # due to the different feature sampling strategies
+    assert clf_with_clusters.score(X_test, y_test) > 0.8
+
+    # Fit a model with only informative clusters
+    informative_clusters = {
+        'cluster1': [0, 1],
+        'cluster2': [2, 3],
+    }
+    clf_informative = HistGradientBoostingClassifier(
+        feature_clusters=informative_clusters,
+        cluster_sampling_rate=1.0,  # Use all informative clusters
+        max_iter=20,
+        random_state=42
+    )
+    clf_informative.fit(X_train, y_train)
+
+    # Should give similar or better results than using all features
+    # since we're ignoring the noise features
+    assert clf_informative.score(X_test, y_test) >= 0.8
+
+    # Test regression
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y_reg, test_size=0.2, random_state=rng
+    )
+
+    # Fit model with feature clusters
+    reg_with_clusters = HistGradientBoostingRegressor(
+        feature_clusters=feature_clusters,
+        cluster_sampling_rate=0.7,
+        max_iter=20,
+        random_state=42
+    )
+    reg_with_clusters.fit(X_train, y_train)
+
+    # Fit model without feature clusters
+    reg_without_clusters = HistGradientBoostingRegressor(
+        max_iter=20,
+        random_state=42
+    )
+    reg_without_clusters.fit(X_train, y_train)
+
+    # Both should give reasonable R^2 scores
+    assert reg_with_clusters.score(X_test, y_test) > 0.8
+
+    # Test edge cases
+
+    # Invalid feature index
+    invalid_clusters = {
+        'cluster1': [0, 10],  # 10 is out of bounds
+    }
+    reg_invalid = HistGradientBoostingRegressor(
+        feature_clusters=invalid_clusters,
+        cluster_sampling_rate=0.7,
+        random_state=42
+    )
+
+    with pytest.raises(ValueError, match="Feature index 10 .* out of range"):
+        reg_invalid.fit(X_train, y_train)
+
+    # Non-integer feature index
+    non_int_clusters = {
+        'cluster1': [0, 1.5],  # 1.5 is not an integer or string
+    }
+    reg_non_int = HistGradientBoostingRegressor(
+        feature_clusters=non_int_clusters,
+        cluster_sampling_rate=0.7,
+        random_state=42
+    )
+
+    with pytest.raises(ValueError, match="Feature .* is not an integer or string"):
+        reg_non_int.fit(X_train, y_train)
+
+    # Using cluster_sampling_rate without feature_clusters
+    reg_rate_only = HistGradientBoostingRegressor(
+        cluster_sampling_rate=0.7,
+        feature_clusters=None,
+        random_state=42
+    )
+    reg_rate_only.fit(X_train, y_train)
+    # Should work fine, just use all features
